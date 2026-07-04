@@ -4,7 +4,33 @@ import GrainyGradient from "./components/ui/gradient-shader-card";
 
 const STORAGE_KEY = "ai-study-assistant.state.v1";
 const GENERAL_THREAD_KEY = "__general__";
-const BASE_URL = `http://${window?.location?.hostname || "127.0.0.1"}:8000`;
+const configuredApiUrl = (import.meta.env.VITE_API_URL || "").trim();
+const API_BASE_URLS = Array.from(
+  new Set(
+    [configuredApiUrl, "http://127.0.0.1:8000", "http://localhost:8000"]
+      .map((url) => url.replace(/\/+$/, ""))
+      .filter(Boolean)
+  )
+);
+
+const buildApiUrl = (baseUrl, path) => `${baseUrl}${path.startsWith("/") ? path : `/${path}`}`;
+
+const apiFetch = async (path, options = {}) => {
+  let lastError = null;
+
+  for (const baseUrl of API_BASE_URLS) {
+    try {
+      return await fetch(buildApiUrl(baseUrl, path), options);
+    } catch (error) {
+      lastError = error;
+      if (error?.message !== "Failed to fetch") {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError || new Error("Failed to fetch");
+};
 
 const createInitialMessage = () => ({
   id: 0,
@@ -33,46 +59,70 @@ const createOfflineFallback = (question, activeDocument, documents) => {
 
   if (activeDocument && activeDocument !== GENERAL_THREAD_KEY) {
     return (
-      `I could not reach the backend, but your file ${activeDocument} is still selected locally. `
-      + "Try again after the server is back online so I can answer from that PDF and show page citations."
+      "Sorry, I'm having trouble connecting right now. "
+      + `Your file "${activeDocument}" is still selected — please try again in a moment.`
     );
   }
 
   if (documents.length > 0) {
     return (
-      "I could not reach the backend, but your uploaded files are still listed locally. "
-      + "Reconnect the server to continue asking questions from those PDFs."
+      "Sorry, I'm temporarily unable to process your question. "
+      + "Your uploaded files are safe — please try again in a moment."
     );
   }
 
-  return "I could not reach the backend. Start the FastAPI server and try again.";
+  return "Sorry, I'm temporarily unavailable. Please upload a PDF and try again in a moment.";
+};
+
+const createFreshState = () => ({
+  threads: { [GENERAL_THREAD_KEY]: [createInitialMessage()] },
+  documents: [],
+  activeDocument: GENERAL_THREAD_KEY,
+});
+
+const isErrorMessage = (msg) => {
+  if (msg.source === "offline") return true;
+  if (msg.role !== "assistant") return false;
+  const text = (msg.text || "").toLowerCase();
+  return (
+    text.includes("failed to fetch") ||
+    text.includes("upload failed") ||
+    text.includes("could not connect") ||
+    text.includes("could not reach") ||
+    text.includes("temporarily unavailable") ||
+    text.includes("could not summarize")
+  );
+};
+
+const filterErrorMessages = (messages) => {
+  if (!Array.isArray(messages)) return [createInitialMessage()];
+  const filtered = messages.filter((msg) => !isErrorMessage(msg));
+  return filtered.length > 0 ? filtered : [createInitialMessage()];
 };
 
 const loadState = () => {
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) {
-      return {
-        threads: { [GENERAL_THREAD_KEY]: [createInitialMessage()] },
-        documents: [],
-        activeDocument: GENERAL_THREAD_KEY,
-      };
-    }
+    if (!raw) return createFreshState();
 
     const parsed = JSON.parse(raw);
+    const threads = parsed.threads && typeof parsed.threads === "object"
+      ? parsed.threads
+      : { [GENERAL_THREAD_KEY]: [createInitialMessage()] };
+
+    // Strip error/offline messages from every thread so stale errors don't show on reload
+    const cleanedThreads = {};
+    for (const [key, msgs] of Object.entries(threads)) {
+      cleanedThreads[key] = filterErrorMessages(msgs);
+    }
+
     return {
-      threads: parsed.threads && typeof parsed.threads === "object"
-        ? parsed.threads
-        : { [GENERAL_THREAD_KEY]: [createInitialMessage()] },
+      threads: cleanedThreads,
       documents: Array.isArray(parsed.documents) ? parsed.documents : [],
       activeDocument: parsed.activeDocument || GENERAL_THREAD_KEY,
     };
   } catch {
-    return {
-      threads: { [GENERAL_THREAD_KEY]: [createInitialMessage()] },
-      documents: [],
-      activeDocument: GENERAL_THREAD_KEY,
-    };
+    return createFreshState();
   }
 };
 
@@ -81,7 +131,6 @@ function App() {
   const [question, setQuestion] = useState("");
   const [isUploading, setIsUploading] = useState(false);
   const [isAsking, setIsAsking] = useState(false);
-  const [selectedFiles, setSelectedFiles] = useState([]);
   const [uploadProgress, setUploadProgress] = useState(null);
   const [ripples, setRipples] = useState([]);
   const [currentTime, setCurrentTime] = useState(0);
@@ -202,7 +251,7 @@ function App() {
       total,
     });
 
-    const response = await fetch(`${BASE_URL}/upload`, {
+    const response = await apiFetch("/upload", {
       method: "POST",
       body: formData,
     });
@@ -244,22 +293,15 @@ function App() {
     return uploadedDocument;
   };
 
-  const uploadSelectedFiles = async () => {
-    if (!selectedFiles.length) {
-      appendMessage(activeDocument, {
-        id: Date.now(),
-        role: "assistant",
-        text: "Choose one or more PDF files first.",
-      });
-      return;
-    }
+  const uploadFilesImmediately = async (files) => {
+    if (!files || files.length === 0) return;
 
     try {
       setIsUploading(true);
       const uploadedNames = [];
 
-      for (let index = 0; index < selectedFiles.length; index += 1) {
-        const uploaded = await uploadSingleFile(selectedFiles[index], index, selectedFiles.length);
+      for (let index = 0; index < files.length; index += 1) {
+        const uploaded = await uploadSingleFile(files[index], index, files.length);
         uploadedNames.push(uploaded.filename);
       }
 
@@ -270,15 +312,18 @@ function App() {
         }));
       }
 
-      setSelectedFiles([]);
       if (fileInputRef.current) {
         fileInputRef.current.value = "";
       }
     } catch (error) {
+      const friendlyMessage = error.message === "Failed to fetch"
+        ? "Could not connect to the server. Please make sure the backend is running and try again."
+        : `Upload failed: ${error.message}`;
       appendMessage(activeDocument, {
         id: Date.now(),
         role: "assistant",
-        text: `Upload failed: ${error.message}`,
+        text: friendlyMessage,
+        source: "offline",
       });
     } finally {
       setIsUploading(false);
@@ -305,7 +350,7 @@ function App() {
     try {
       setIsAsking(true);
 
-      const response = await fetch(`${BASE_URL}/ask`, {
+      const response = await apiFetch("/ask", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -334,7 +379,7 @@ function App() {
       appendMessage(threadKey, {
         id: Date.now() + 2,
         role: "assistant",
-        text: `${createOfflineFallback(trimmedQuestion, threadKey, documents)}\n\nBackend note: ${error.message}`,
+        text: createOfflineFallback(trimmedQuestion, threadKey, documents),
         source: "offline",
       });
     } finally {
@@ -356,7 +401,7 @@ function App() {
       setIsAsking(true);
       setState((prev) => ({ ...prev, activeDocument: filename }));
 
-      const response = await fetch(`${BASE_URL}/summary`, {
+      const response = await apiFetch("/summary", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -379,10 +424,13 @@ function App() {
         citations: Array.isArray(data?.citations) ? data.citations : [],
       });
     } catch (error) {
+      const friendlyMessage = error.message === "Failed to fetch"
+        ? `Could not summarize "${filename}" — the server is temporarily unavailable. Please try again in a moment.`
+        : `Could not summarize "${filename}". ${error.message}`;
       appendMessage(filename, {
         id: Date.now() + 1,
         role: "assistant",
-        text: `Could not summarize ${filename}. ${error.message}`,
+        text: friendlyMessage,
         source: "offline",
       });
     } finally {
@@ -425,7 +473,7 @@ function App() {
               </div>
 
               <p>
-                Choose PDF files, preview them before upload, and generate summaries from the selected document.
+                Upload PDF files and generate summaries from your documents.
               </p>
 
               <div className="file-picker">
@@ -435,15 +483,7 @@ function App() {
                   onClick={() => fileInputRef.current && fileInputRef.current.click()}
                   disabled={isUploading || isAsking}
                 >
-                  Choose PDFs
-                </button>
-                <button
-                  type="button"
-                  className="primary-button secondary"
-                  onClick={uploadSelectedFiles}
-                  disabled={isUploading || isAsking || selectedFiles.length === 0}
-                >
-                  Upload selected
+                  Upload PDFs
                 </button>
                 <input
                   ref={fileInputRef}
@@ -452,26 +492,12 @@ function App() {
                   multiple
                   style={{ display: "none" }}
                   onChange={(event) => {
-                    const nextFiles = Array.from(event.target.files || []);
-                    setSelectedFiles(nextFiles);
+                    const files = Array.from(event.target.files || []);
+                    if (files.length > 0) {
+                      uploadFilesImmediately(files);
+                    }
                   }}
                 />
-              </div>
-
-              <div className="preview-card">
-                <div className="preview-title">Selected files</div>
-                {selectedFiles.length > 0 ? (
-                  <div className="selected-file-list">
-                    {selectedFiles.map((file) => (
-                      <div key={`${file.name}-${file.size}`} className="selected-file-item">
-                        <strong>{file.name}</strong>
-                        <span>{Math.ceil(file.size / 1024)} KB</span>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <p className="preview-empty">No files selected yet.</p>
-                )}
               </div>
 
               <div className="document-list">

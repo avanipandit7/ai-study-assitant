@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from typing import Optional
+import os
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -18,17 +19,32 @@ load_dotenv()
 # create app
 app = FastAPI()
 
+# Parse allowed origins from env (comma-separated). Fall back to local dev URLs.
+configured_origins = [
+    origin.strip()
+    for origin in os.getenv("ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+]
+allowed_origins = configured_origins or [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
 # enable CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=allowed_origins,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # global vector database
 vectorstore = None
+# cache original page text for precise file-specific extraction
+uploaded_page_cache = {}
 
 
 def get_source_filter(source_name: Optional[str]):
@@ -70,6 +86,158 @@ def fallback_answer(question: str, context: str) -> str:
 
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip().lower()
+
+
+def extract_answer_from_cached_pages(question: str, source_name: Optional[str]):
+    if not source_name:
+        return None
+
+    pages = uploaded_page_cache.get(source_name) or []
+    if not pages:
+        file_path = f"./{source_name}"
+        if os.path.exists(file_path):
+            try:
+                loader = PyPDFLoader(file_path)
+                loaded_docs = loader.load()
+                pages = [
+                    {
+                        "page": int((document.metadata or {}).get("page", 0)) + 1,
+                        "text": document.page_content or "",
+                    }
+                    for document in loaded_docs
+                ]
+                uploaded_page_cache[source_name] = pages
+            except Exception:
+                pages = []
+
+    if not pages:
+        return None
+
+    question_lower = (question or "").lower().strip()
+    stopwords = {
+        "what", "is", "the", "a", "an", "of", "for", "to", "in", "on", "and", "or",
+        "please", "tell", "me", "about", "explain", "with", "from", "this", "that"
+    }
+    query_tokens = [
+        token for token in re.findall(r"\w+", question_lower)
+        if len(token) > 2 and token not in stopwords
+    ]
+
+    section_headings = {
+        "objective", "career objective", "professional objective", "summary", "profile",
+        "education", "academic background", "experience", "work experience", "projects",
+        "academic projects", "skills", "technical skills", "certifications", "achievements",
+        "internship", "interests", "contact", "profile summary"
+    }
+
+    section_aliases = {
+        "objective": ["objective", "career objective", "professional objective"],
+        "education": ["education", "academic", "qualification"],
+        "experience": ["experience", "work experience", "internship"],
+        "projects": ["project", "projects"],
+        "skills": ["skill", "skills", "technical skills"],
+        "certifications": ["certification", "certifications"],
+        "contact": ["contact", "email", "phone"],
+        "summary": ["summary", "profile", "about"],
+    }
+
+    def canonical_heading(line: str) -> str:
+        cleaned = (line or "").strip().lower().rstrip(":")
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned
+
+    def looks_like_new_heading(line: str) -> bool:
+        cleaned = (line or "").strip()
+        lower = canonical_heading(cleaned)
+        if not cleaned:
+            return False
+        if lower in section_headings:
+            return True
+        if re.match(r"^(education|experience|work experience|projects|skills|technical skills|summary|profile|objective|certifications|contact|achievements|internship)\b", lower):
+            return True
+        return False
+
+    requested_section = None
+    for section_name, aliases in section_aliases.items():
+        if any(alias in question_lower for alias in aliases):
+            requested_section = section_name
+            break
+
+    # First pass: if a question token appears in a heading-like line, return that section body.
+    for page in pages:
+        lines = [line.strip() for line in (page.get("text") or "").splitlines() if line.strip()]
+        for i, line in enumerate(lines):
+            lower = line.lower()
+            if not any(token in lower for token in query_tokens):
+                continue
+            heading_key = canonical_heading(line)
+            heading_matches_query = requested_section and requested_section in heading_key
+            is_heading_candidate = (
+                line.endswith(":")
+                or heading_key in section_headings
+                or re.match(r"^(career\s+)?objective\b", lower)
+            )
+
+            if is_heading_candidate and (heading_matches_query or not requested_section):
+                collected = [line]
+                min_lines_before_break = 3
+                for j in range(i + 1, min(i + 24, len(lines))):
+                    next_line = lines[j]
+                    if (
+                        looks_like_new_heading(next_line)
+                        and len(collected) >= min_lines_before_break
+                    ):
+                        break
+                    collected.append(next_line)
+                    if len(" ".join(collected)) >= 2000:
+                        break
+
+                answer = "\n".join(collected).strip()
+                if answer:
+                    return {
+                        "answer": answer,
+                        "page": page.get("page", 1),
+                    }
+
+    # Second pass: score all lines by keyword overlap and return the best local window.
+    best = None
+    for page in pages:
+        lines = [line.strip() for line in (page.get("text") or "").splitlines() if line.strip()]
+        for i, line in enumerate(lines):
+            tokens = [token for token in re.findall(r"\w+", line.lower()) if len(token) > 2]
+            if not tokens:
+                continue
+            overlap = sum(1 for token in query_tokens if token in tokens)
+            if overlap == 0:
+                continue
+            score = overlap / (len(tokens) + 1)
+            if line.endswith(":"):
+                score += 0.15
+            candidate = (score, page.get("page", 1), i, lines)
+            if best is None or candidate[0] > best[0]:
+                best = candidate
+
+    if best is None:
+        return None
+
+    _, page_number, line_idx, lines = best
+    start = max(0, line_idx - 1)
+    end = min(len(lines), line_idx + 16)
+    snippet = []
+    for idx in range(start, end):
+        line = lines[idx]
+        if len(snippet) >= 4 and looks_like_new_heading(line):
+            break
+        snippet.append(line)
+
+    answer = "\n".join(snippet).strip()
+    if not answer:
+        return None
+
+    return {
+        "answer": answer,
+        "page": page_number,
+    }
 
 
 def dedupe_preserve_order(items):
@@ -295,7 +463,7 @@ def extractive_answer_from_context(question: str, context: str, max_sentences: i
     # If there is no obvious match, return a short clean excerpt from the top of the PDF text.
     if best_score <= 0:
         excerpt = " ".join(lines[: min(len(lines), 12)])
-        return f"Answer taken from your PDF: {excerpt[:1200]}"
+        return excerpt[:1200]
 
     # Expand around the best matching line so we capture the definition + the bullets that follow.
     start = max(0, best_idx - 1)
@@ -321,8 +489,9 @@ def extractive_answer_from_context(question: str, context: str, max_sentences: i
             selected.append(line)
 
     max_output_lines = 24 if is_broad_question else (max_sentences + 6)
-    answer_text = reflow_pdf_lines(selected[:max_output_lines])
-    return f"Answer extracted from your uploaded PDF:\n{answer_text}"
+    answer_lines = selected[:max_output_lines]
+    answer_text = "\n".join(answer_lines).strip()
+    return answer_text
 
 
 # home route
@@ -336,6 +505,7 @@ def home():
 async def upload_pdf(file: UploadFile = File(...)):
 
     global vectorstore
+    global uploaded_page_cache
 
     try:
         source_name = normalize_file_name(file.filename)
@@ -349,6 +519,13 @@ async def upload_pdf(file: UploadFile = File(...)):
         # load pdf
         loader = PyPDFLoader(file_path)
         documents = loader.load()
+        uploaded_page_cache[source_name] = [
+            {
+                "page": int((document.metadata or {}).get("page", 0)) + 1,
+                "text": document.page_content or "",
+            }
+            for document in documents
+        ]
 
         # split text
         text_splitter = RecursiveCharacterTextSplitter(
@@ -401,9 +578,27 @@ class SummaryRequest(BaseModel):
 async def ask_question(data: QuestionRequest):
 
     global vectorstore
+    global uploaded_page_cache
 
     try:
         source_name = normalize_file_name(data.filename) if data.filename else None
+
+        # Prefer precise extraction from the selected file's original page text.
+        direct_answer = extract_answer_from_cached_pages(data.question, source_name)
+        if direct_answer:
+            return {
+                "question": data.question,
+                "answer": direct_answer["answer"],
+                "source": "pdf",
+                "filename": source_name,
+                "citations": [
+                    {
+                        "source": source_name,
+                        "page": int(direct_answer.get("page", 1)),
+                        "excerpt": " ".join((direct_answer.get("answer") or "").split())[:180],
+                    }
+                ],
+            }
 
         # retrieve relevant chunks when a PDF has been uploaded
         if vectorstore is None:
