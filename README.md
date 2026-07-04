@@ -135,6 +135,8 @@ curl -X POST http://localhost:8000/ask \
 1. Push the repo to GitHub.
 2. Import the project on [Vercel](https://vercel.com).
 3. Set **Root Directory** to `frontend`.
+4. Add environment variable:
+  - **VITE_API_URL** → your deployed backend URL (example: `https://your-backend.onrender.com`)
 4. Vercel auto-detects Vite and sets:
    - **Build Command** → `npm run build`
    - **Output Directory** → `dist`
@@ -146,8 +148,10 @@ The FastAPI backend needs a Python runtime and cannot run on Vercel's static hos
 
 1. Point the platform to the `backend/` directory.
 2. Set the start command to: `uvicorn main:app --host 0.0.0.0 --port $PORT`
-3. Add your environment variables (e.g., `OPENAI_API_KEY`).
-4. Update the frontend's `BASE_URL` in `App.jsx` to point to your deployed backend URL.
+3. Add environment variable:
+  - **ALLOWED_ORIGINS** → your frontend URL (example: `https://avanipandit7-ai-study-assistant.vercel.app`)
+4. Keep CORS open (`*`) only for quick testing. For production, always set `ALLOWED_ORIGINS`.
+5. Ensure the URL in frontend `VITE_API_URL` points to this backend service.
 
 ## 🤝 Contributing
 

@@ -5,9 +5,14 @@ import GrainyGradient from "./components/ui/gradient-shader-card";
 const STORAGE_KEY = "ai-study-assistant.state.v1";
 const GENERAL_THREAD_KEY = "__general__";
 const configuredApiUrl = (import.meta.env.VITE_API_URL || "").trim();
+const runtimeHost = typeof window !== "undefined" ? window.location.hostname : "";
+const isLocalRuntime = runtimeHost === "localhost" || runtimeHost === "127.0.0.1";
 const API_BASE_URLS = Array.from(
   new Set(
-    [configuredApiUrl, "http://127.0.0.1:8000", "http://localhost:8000"]
+    [
+      configuredApiUrl,
+      ...(isLocalRuntime ? ["http://127.0.0.1:8000", "http://localhost:8000"] : []),
+    ]
       .map((url) => url.replace(/\/+$/, ""))
       .filter(Boolean)
   )
@@ -16,6 +21,10 @@ const API_BASE_URLS = Array.from(
 const buildApiUrl = (baseUrl, path) => `${baseUrl}${path.startsWith("/") ? path : `/${path}`}`;
 
 const apiFetch = async (path, options = {}) => {
+  if (API_BASE_URLS.length === 0) {
+    throw new Error("VITE_API_URL is not configured for this deployment");
+  }
+
   let lastError = null;
 
   for (const baseUrl of API_BASE_URLS) {
@@ -318,6 +327,8 @@ function App() {
     } catch (error) {
       const friendlyMessage = error.message === "Failed to fetch"
         ? "Could not connect to the server. Please make sure the backend is running and try again."
+        : error.message.includes("VITE_API_URL is not configured")
+          ? "Backend URL is missing in deployment. Set VITE_API_URL in Vercel to your backend API URL and redeploy."
         : `Upload failed: ${error.message}`;
       appendMessage(activeDocument, {
         id: Date.now(),
@@ -426,6 +437,8 @@ function App() {
     } catch (error) {
       const friendlyMessage = error.message === "Failed to fetch"
         ? `Could not summarize "${filename}" — the server is temporarily unavailable. Please try again in a moment.`
+        : error.message.includes("VITE_API_URL is not configured")
+          ? `Could not summarize "${filename}" because VITE_API_URL is missing in deployment.`
         : `Could not summarize "${filename}". ${error.message}`;
       appendMessage(filename, {
         id: Date.now() + 1,
